@@ -16,6 +16,7 @@
     "build": "tsx src/build/build-package.ts",
     "prepare": "pnpm build",
     "orange": "tsx src/bin.ts",
+    "unikraft:local": "tsx scripts/unikraft/run-local.ts",
     "prepack": "pnpm build",
     "release": "tsx scripts/release/main.ts",
     "test": "pnpm test:unit && pnpm test:e2e 'tests/*/*.test.ts'",

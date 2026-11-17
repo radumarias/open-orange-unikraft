@@ -62,7 +62,16 @@ function findPackageManifest(
 }
 
 function usesMusl(): boolean {
-	const report: unknown = process.report?.getReport();
+	// A host with a partial Linux ABI, such as a Unikraft unikernel, can fail to build a report.
+	// OPEN_ORANGE_LIBC=gnu or musl then names the C library instead.
+	const forced = process.env.OPEN_ORANGE_LIBC;
+	if (forced === "gnu" || forced === "musl") return forced === "musl";
+	let report: unknown;
+	try {
+		report = process.report?.getReport();
+	} catch {
+		return true;
+	}
 	if (!isRecord(report) || !isRecord(report.header)) {
 		return true;
 	}

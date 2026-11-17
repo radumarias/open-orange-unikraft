@@ -72,6 +72,7 @@ const deployOptions = {
 	config: { multiple: true, short: "c", type: "string" },
 	"dry-run": { type: "boolean" },
 	env: { short: "e", type: "string" },
+	unikraft: { type: "boolean" },
 	image: { type: "string" },
 	"machine-type": { type: "string" },
 	"node-count": { type: "string" },
@@ -98,6 +99,7 @@ export function renderDeployHelp(theme: Theme): string {
 		option("-e, --env <name>", "Wrangler environment from the configuration. Not a variable."),
 		option("--dry-run", "Write the Dockerfile and build context and print the plan. Calls no API."),
 		option("--outdir <dir>", "Write the build context here. Default .open-orange/deploy."),
+		option("--unikraft", "Also write a Kraftfile and an image that runs as a Unikraft unikernel. Implies --dry-run."),
 		`\n${theme.bold("Rivet cluster")}`,
 		option("--cluster <name>", "Cluster to deploy to. Default RIVET_CLUSTER, then the linked cluster."),
 		option("--org <slug>", "Organization of the cluster. Default RIVET_ORG, then the linked one."),
@@ -181,7 +183,12 @@ async function executeDeployCommand(args: readonly string[], io: DeployCommandIo
 		...(organization === undefined ? {} : { organization }),
 		...(values.region === undefined ? {} : { region: values.region }),
 	};
-	const dryRun = values["dry-run"] === true;
+	const unikraft = values.unikraft === true;
+	if (unikraft && existingBuild !== undefined) {
+		throw new ExpectedFailure("--unikraft writes a new build, so it takes no --build.");
+	}
+	// A unikernel image runs on your own machines. There is nothing to roll out to a Rivet cluster.
+	const dryRun = values["dry-run"] === true || unikraft;
 	if (!dryRun) requireCredentials(target);
 
 	const configPath = values.config?.[0];
@@ -225,6 +232,7 @@ async function executeDeployCommand(args: readonly string[], io: DeployCommandIo
 					: { configPath: relative(config.projectRoot, config.configPath) }),
 				...(values.env === undefined ? {} : { environment: values.env }),
 				...(config.build === undefined ? {} : { builtOnHost: true }),
+				...(unikraft ? { unikraft: true } : {}),
 			},
 			{
 				...(config.additionalModuleSearch === undefined ? {} : { additionalModules: config.additionalModuleSearch }),
@@ -534,6 +542,31 @@ function rollbackHint(cluster: string, region: string, pool: string, previous: s
 	return `\nRoll back with: orange deploy --cluster ${cluster} --region ${region} --pool ${pool} --build ${previous}`;
 }
 
+function printUnikraftPlan(io: DeployCommandIo, theme: Theme, build: BuildContext, reference: string): void {
+	const directory = dirname(build.dockerfilePath);
+	const shell = (command: string[]): string => `  ${command.map(shellQuote).join(" ")}`;
+	io.log(theme.bold("Wrote a Unikraft build. Nothing was built or sent to Rivet Cloud."));
+	io.log("");
+	io.log(`${"Dockerfile".padEnd(12)}${build.dockerfilePath}`);
+	io.log(`${"Kraftfile".padEnd(12)}${join(directory, "Kraftfile")}`);
+	io.log(`${"Image".padEnd(12)}${reference}`);
+	io.log("");
+	io.log(theme.bold("Build and run"));
+	io.log(shell(["docker", "build", "--platform", "linux/amd64", "-f", build.dockerfilePath, "-t", reference, build.contextDirectory]));
+	io.log(
+		shell([
+			"docker", "build", "--platform", "linux/amd64", "--build-arg", `IMAGE=${reference}`,
+			"-f", join(directory, unikraftRootfsDockerfileName), "--output", `type=local,dest=${join(directory, "rootfs")}`, directory,
+		]),
+	);
+	io.log(
+		shell([
+			"kraft", "run", "--plat", "qemu", "--arch", "x86_64", "-M", "3Gi", "-p", `${imagePort}:${imagePort}`,
+			"-e", "RIVET_ENDPOINT=http://<namespace>:<token>@<engine-host>:6420", directory,
+		]),
+	);
+}
+
 function printDryRun(
 	io: DeployCommandIo,
 	theme: Theme,
@@ -548,6 +581,10 @@ function printDryRun(
 ): void {
 	const { build, target } = plan;
 	const row = (label: string, value: string): void => io.log(`${label.padEnd(12)}${value}`);
+	if (build?.unikraft === true) {
+		printUnikraftPlan(io, theme, build, plan.reference);
+		return;
+	}
 	io.log(theme.bold("Dry run. Nothing was built or sent to Rivet Cloud."));
 	io.log("");
 	if (build !== undefined) {
@@ -653,6 +690,8 @@ function utcTimestamp(date: Date): string {
 interface BuildContext {
 	contextDirectory: string;
 	dockerfilePath: string;
+	// Dockerfile.rootfs and a Kraftfile sit next to the Dockerfile.
+	unikraft?: boolean;
 }
 
 // Writes `<directory>/Dockerfile` and `<directory>/context`, which hold the
@@ -676,7 +715,10 @@ async function writeBuildContext(
 	// A second run replaces Orange's own output and nothing else.
 	const foreign = existsSync(directory)
 		? (await readdir(directory)).filter(
-				(entry) => entry !== "context" && !(entry === "Dockerfile" && isGeneratedDockerfile(dockerfilePath)),
+				(entry) =>
+					entry !== "context" &&
+					!(generatedFiles.includes(entry) && isGeneratedDockerfile(join(directory, entry))) &&
+					!unikraftOutputs.includes(entry),
 			)
 		: [];
 	if (foreign.length > 0) {
@@ -684,7 +726,7 @@ async function writeBuildContext(
 			`--outdir ${directory} holds files that orange deploy did not write: ${foreign.join(", ")}. Pass an empty or new directory.`,
 		);
 	}
-	await rm(dockerfilePath, { force: true });
+	for (const entry of [...generatedFiles, ...unikraftOutputs]) await rm(join(directory, entry), { force: true, recursive: true });
 	await rm(contextDirectory, { force: true, recursive: true });
 	await mkdir(contextDirectory, { recursive: true });
 	// `main` can sit outside the project, as in `../worker/src/index.ts`. The image then keeps the
@@ -748,14 +790,23 @@ async function writeBuildContext(
 		contextDirectory,
 		imageOnlyWhenUsed({ usesSandbox, usesWorkerLoader: worker.usesWorkerLoader }),
 	);
-	await writeFile(
-		dockerfilePath,
-		dockerfile({ ...image, packageManager, projectDirectory: projectInImage.split(sep).join("/") }),
-	);
-	return { contextDirectory, dockerfilePath };
+	const imageOptions = { ...image, packageManager, projectDirectory: projectInImage.split(sep).join("/") };
+	await writeFile(dockerfilePath, dockerfile(imageOptions));
+	if (image.unikraft === true) {
+		await writeFile(join(directory, unikraftRootfsDockerfileName), unikraftRootfsDockerfile());
+		await writeFile(join(directory, "Kraftfile"), kraftfile(imageOptions));
+	}
+	return { contextDirectory, dockerfilePath, ...(image.unikraft === true ? { unikraft: true } : {}) };
 }
 
 const generatedDockerfileHeader = "# Generated by orange deploy.";
+const unikraftRootfsDockerfileName = "Dockerfile.rootfs";
+// Files `orange deploy` writes and replaces on the next run. They start with the generated header.
+const generatedFiles = ["Dockerfile", unikraftRootfsDockerfileName, "Kraftfile"];
+// What building the unikernel writes next to them.
+const unikraftOutputs = ["rootfs", ".unikraft"];
+// Where `orange serve --prebuild` writes the Worker bundle inside a unikernel image.
+const unikraftBundleDirectory = "/orange-bundle";
 
 function isGeneratedDockerfile(path: string): boolean {
 	return readFileSync(path, "utf8").startsWith(generatedDockerfileHeader);
@@ -883,15 +934,85 @@ interface DockerfileOptions {
 	packageManager: string;
 	// The project's place below /app, when `main` is outside the project. Empty otherwise.
 	projectDirectory?: string;
+	// The image runs as a Unikraft unikernel: one process, so the Worker is bundled at build time
+	// and the runtime runs in the CLI's process.
+	unikraft?: boolean;
 }
 
-function dockerfile(options: DockerfileOptions): string {
-	const command = [
-		"orange",
+function serveArguments(options: DockerfileOptions): string[] {
+	return [
 		"serve",
 		...(options.configPath === undefined ? [] : ["--config", options.configPath]),
 		...(options.environment === undefined ? [] : ["--env", options.environment]),
 	];
+}
+
+function imageWorkingDirectory(options: DockerfileOptions): string {
+	return options.projectDirectory === undefined || options.projectDirectory === ""
+		? "/app"
+		: posix.join("/app", options.projectDirectory);
+}
+
+// A unikernel gets no image ENV, so the Kraftfile and `kraft run -e` repeat these.
+function unikraftEnvironment(options: DockerfileOptions): string[] {
+	return [
+		"OPEN_ORANGE_IN_PROCESS=1",
+		// node:24-slim is Debian, so RivetKit loads its glibc binary.
+		"OPEN_ORANGE_LIBC=gnu",
+		`OPEN_ORANGE_PREBUILT_BUNDLE=${unikraftBundleDirectory}`,
+		`OPEN_ORANGE_CWD=${imageWorkingDirectory(options)}`,
+		"NODE_ENV=production",
+		`PORT=${imagePort}`,
+		...(options.builtOnHost === true ? [`${customBuildDoneVariable}=1`] : []),
+	];
+}
+
+// Packs the image's file system into the initrd that the unikernel boots from. It runs on
+// Linux inside Docker, so a case-insensitive host file system never sees node_modules.
+function unikraftRootfsDockerfile(): string {
+	return [
+		generatedDockerfileHeader,
+		"# Build: docker build --build-arg IMAGE=<the Dockerfile's image> -f Dockerfile.rootfs --output type=local,dest=rootfs .",
+		"ARG IMAGE",
+		"FROM ${IMAGE} AS app",
+		"",
+		"FROM debian:bookworm-slim AS pack",
+		"RUN apt-get update && apt-get install -y --no-install-recommends cpio && rm -rf /var/lib/apt/lists/*",
+		"COPY --from=app / /rootfs/",
+		// Package caches and docs are not needed to serve, and every byte sits in guest memory.
+		"RUN rm -rf /rootfs/root/.cache /rootfs/root/.npm /rootfs/root/.local/share/pnpm /rootfs/usr/share/doc /rootfs/usr/share/man /rootfs/var/lib/apt/lists/* \\",
+		// `orange serve` against an external Engine runs neither workerd nor a local Engine, but Wrangler
+		// and RivetKit resolve their packages when they load. Empty binaries keep 200 MB out of memory.
+		"    && find /rootfs/orange/node_modules/.pnpm \\( -path '*/@cloudflare/workerd-linux-*/bin/workerd' -o -path '*/@rivetkit/engine-cli-linux-*/rivet-engine' \\) -type f -exec truncate -s 0 {} + \\",
+		"    && mkdir -p /rootfs/tmp /rootfs/proc /rootfs/sys /rootfs/dev && chmod 1777 /rootfs/tmp \\",
+		"    && cd /rootfs && find . -mindepth 1 | cpio --quiet -o -H newc > /rootfs.cpio",
+		"",
+		"FROM scratch",
+		"COPY --from=pack /rootfs.cpio /rootfs.cpio",
+		"",
+	].join("\n");
+}
+
+// Runs the image's file system on Unikraft's ELF loader, which runs Linux binaries such as node.
+// https://unikraft.org/docs/cli/packaging
+function kraftfile(options: DockerfileOptions): string {
+	const command = ["/usr/local/bin/node", "/orange/dist/bin.js", ...serveArguments(options)];
+	return [
+		generatedDockerfileHeader,
+		"# Run: kraft run --plat qemu --arch x86_64 -M 3Gi -p 8080:8080 -e RIVET_ENDPOINT=... .",
+		"spec: v0.6",
+		"name: open-orange-worker",
+		"runtime: unikraft.org/base:latest",
+		"rootfs: ./rootfs/rootfs.cpio",
+		`cmd: ${JSON.stringify(command)}`,
+		"env:",
+		...unikraftEnvironment(options).map((variable) => `  ${variable.slice(0, variable.indexOf("="))}: ${JSON.stringify(variable.slice(variable.indexOf("=") + 1))}`),
+		"",
+	].join("\n");
+}
+
+function dockerfile(options: DockerfileOptions): string {
+	const command = ["orange", ...serveArguments(options)];
 	return [
 		generatedDockerfileHeader,
 		"FROM node:24-slim AS orange",
@@ -913,6 +1034,13 @@ function dockerfile(options: DockerfileOptions): string {
 			: [`WORKDIR ${posix.join("/app", options.projectDirectory)}`]),
 		`ENV NODE_ENV=production PORT=${imagePort}`,
 		...(options.builtOnHost === true ? [`ENV ${customBuildDoneVariable}=1`] : []),
+		...(options.unikraft === true
+			? [
+					// A unikernel runs one process: esbuild cannot start at boot and the runtime cannot be forked.
+					`RUN ${["orange", ...serveArguments(options), "--prebuild", unikraftBundleDirectory].join(" ")}`,
+					`ENV ${unikraftEnvironment(options).join(" ")}`,
+				]
+			: []),
 		`EXPOSE ${imagePort}`,
 		`CMD ${JSON.stringify(command)}`,
 		"",

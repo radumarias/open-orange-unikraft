@@ -1267,3 +1267,41 @@ test("a large Worker under orange serve keeps its deployment's memory small", { 
 		await engine.stop();
 	}
 });
+
+// What an `orange deploy --unikraft` image runs: a unikernel has one process, so the Worker is
+// bundled before the image starts and the runtime runs in the CLI's own process.
+test("orange serve runs in one process from a prebuilt bundle, as a Unikraft image does", { timeout: 180_000 }, async () => {
+	const engine = await startStandaloneEngine();
+	const project = await copyProject(join(repositoryRoot, "examples", "hello-durable-object"));
+	const bundleDirectory = await mkdtemp(join(tmpdir(), "open-orange-prebuilt-"));
+	let serve: RunningServe | undefined;
+	try {
+		const bundling = spawn(
+			process.execPath,
+			["--import", "tsx", cliEntrypoint, "serve", "--config", join(project.directory, "wrangler.jsonc"), "--prebuild", bundleDirectory],
+			{ cwd: repositoryRoot, env: process.env, stdio: ["ignore", "pipe", "pipe"] },
+		);
+		const bundlingOutput = collectOutput(bundling);
+		assert.equal(await withDeadline(exited(bundling), "orange serve --prebuild", 60_000), 0, bundlingOutput());
+		// The bundle must come from --prebuild: the Worker's source is gone when it serves.
+		await rm(join(project.directory, "src"), { force: true, recursive: true });
+
+		const port = await freePort();
+		serve = await startServe(project.directory, engine.endpoint, port, {
+			OPEN_ORANGE_IN_PROCESS: "1",
+			OPEN_ORANGE_PREBUILT_BUNDLE: bundleDirectory,
+		});
+		assert.deepEqual(await greet(serve, port, "unikernel"), { greeting: "Hello, unikernel!", visits: 1 });
+		assert.deepEqual(await greet(serve, port, "unikernel"), { greeting: "Hello, unikernel!", visits: 2 });
+
+		const exit = exited(serve.child);
+		serve.child.kill("SIGTERM");
+		assert.equal(await withDeadline(exit, "in-process orange serve stop", 30_000), 0, serve.output());
+		serve = undefined;
+	} finally {
+		if (serve !== undefined) serve.child.kill("SIGKILL");
+		await rm(bundleDirectory, { force: true, recursive: true });
+		await project.dispose();
+		await engine.stop();
+	}
+});

@@ -1,6 +1,6 @@
-import { fork, type ChildProcess } from "node:child_process";
+import { fork } from "node:child_process";
 import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { runtimeModuleRewrites } from "../build/rewrite-module-imports.js";
 import {
@@ -21,6 +21,7 @@ import {
 	type RuntimeStoppedMessage,
 	type RuntimeWarningMessage,
 } from "../../packages/runtime-node/src/process-protocol.js";
+import { inProcessRuntimeRequested, startInProcessRuntime, type RuntimeChild } from "./in-process.js";
 
 export interface SpawnRuntimeOptions {
 	additionalModules?: readonly { name: string; path: string }[];
@@ -56,6 +57,9 @@ export interface SpawnRuntimeOptions {
 	rivetEndpoint?: string;
 	rivetNamespace: string;
 	rivetStoragePath: string;
+	// Run the runtime in this process instead of forking it. Defaults to OPEN_ORANGE_IN_PROCESS.
+	// Logs then go straight to this process's output, so onOutput and stdout do not apply.
+	inProcess?: boolean;
 	// False keeps the runtime from serving RIVETKIT_METRICS_PORT.
 	serveMetrics?: boolean;
 	session?: RuntimeSessionConfiguration;
@@ -87,7 +91,7 @@ export interface RuntimeProcess {
 }
 
 function send(
-	child: ChildProcess,
+	child: RuntimeChild,
 	message: RuntimeSessionWorkersMessage | RuntimeStartMessage | { type: "shutdown" },
 ): void {
 	if (!child.connected) {
@@ -126,28 +130,38 @@ export async function spawnRuntime(
 	options: SpawnRuntimeOptions,
 ): Promise<RuntimeProcess> {
 	const runnerPath = runtimeRunnerPath();
-	const child = fork(runnerPath, [], {
-		env: {
-			...process.env,
-			// RivetKit's native Engine spawner reads the storage path from the process
-			// environment. Bun does not copy runtime `process.env` writes there.
-			RIVETKIT_STORAGE_PATH: options.rivetStoragePath,
-			...(options.rivetLogLevel === undefined ? {} : { RIVET_LOG_LEVEL: options.rivetLogLevel }),
-			// One port can have one metrics server, so only one runtime of a deployment serves it.
-			...(options.serveMetrics === false ? { RIVETKIT_METRICS_PORT: undefined } : {}),
-		},
-		// The built package runs plain JavaScript. Only a source checkout needs tsx,
-		// and it has tsx installed.
-		execArgv: runnerPath.endsWith(".ts") ? ["--import", "tsx"] : [],
-		stdio:
-			options.onOutput === undefined
-				? ["ignore", options.stdout === "stderr" ? 2 : "inherit", "inherit", "ipc"]
-				: ["ignore", "pipe", "pipe", "ipc"],
-	});
-	if (options.onOutput !== undefined) {
-		const onOutput = options.onOutput;
-		child.stdout?.on("data", (chunk: Buffer) => onOutput(chunk, "stdout"));
-		child.stderr?.on("data", (chunk: Buffer) => onOutput(chunk, "stderr"));
+	const runtimeEnvironment = {
+		// RivetKit's native Engine spawner reads the storage path from the process
+		// environment. Bun does not copy runtime `process.env` writes there.
+		RIVETKIT_STORAGE_PATH: options.rivetStoragePath,
+		...(options.rivetLogLevel === undefined ? {} : { RIVET_LOG_LEVEL: options.rivetLogLevel }),
+		// One port can have one metrics server, so only one runtime of a deployment serves it.
+		...(options.serveMetrics === false ? { RIVETKIT_METRICS_PORT: undefined } : {}),
+	};
+	let child: RuntimeChild;
+	if (options.inProcess ?? inProcessRuntimeRequested()) {
+		child = startInProcessRuntime({
+			environment: runtimeEnvironment,
+			importRunner: async () =>
+				(await import(pathToFileURL(runnerPath).href)) as typeof import("../../packages/runtime-node/src/runner.js"),
+		});
+	} else {
+		const forked = fork(runnerPath, [], {
+			env: { ...process.env, ...runtimeEnvironment },
+			// The built package runs plain JavaScript. Only a source checkout needs tsx,
+			// and it has tsx installed.
+			execArgv: runnerPath.endsWith(".ts") ? ["--import", "tsx"] : [],
+			stdio:
+				options.onOutput === undefined
+					? ["ignore", options.stdout === "stderr" ? 2 : "inherit", "inherit", "ipc"]
+					: ["ignore", "pipe", "pipe", "ipc"],
+		});
+		if (options.onOutput !== undefined) {
+			const onOutput = options.onOutput;
+			forked.stdout?.on("data", (chunk: Buffer) => onOutput(chunk, "stdout"));
+			forked.stderr?.on("data", (chunk: Buffer) => onOutput(chunk, "stderr"));
+		}
+		child = forked;
 	}
 	const readiness = Promise.withResolvers<{
 		cronNextRuns: { cron: string; nextRunAt: number }[];

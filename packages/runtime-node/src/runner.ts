@@ -163,9 +163,50 @@ import {
 	type ServiceBindingOptions,
 } from "./runtime.js";
 
+/**
+ * The runtime's link to the CLI that started it. `orange dev` and `orange serve` fork the runtime
+ * and talk over Node's IPC channel. With OPEN_ORANGE_IN_PROCESS=1 the CLI runs the runtime in its
+ * own process instead, for hosts that cannot start a second process, such as a Unikraft unikernel.
+ */
+export interface RuntimeParentChannel {
+	readonly connected: boolean;
+	send(message: RuntimeChildMessage): void;
+	onMessage(listener: (message: unknown) => void): void;
+	onDisconnect(listener: () => void): void;
+	disconnect(): void;
+	/** False when the runtime shares its process with the CLI, which owns signals and exit. */
+	readonly ownsProcess: boolean;
+}
+
+function processParentChannel(): RuntimeParentChannel {
+	return {
+		get connected() {
+			return process.connected;
+		},
+		send(message) {
+			if (process.send !== undefined && process.connected) {
+				process.send(message);
+			}
+		},
+		onMessage(listener) {
+			process.on("message", listener);
+		},
+		onDisconnect(listener) {
+			process.once("disconnect", listener);
+		},
+		disconnect() {
+			if (process.connected) process.disconnect();
+		},
+		ownsProcess: true,
+	};
+}
+
+let parentChannel: RuntimeParentChannel | undefined;
+
 function send(message: RuntimeChildMessage): void {
-	if (process.send !== undefined && process.connected) {
-		process.send(message);
+	parentChannel ??= processParentChannel();
+	if (parentChannel.connected) {
+		parentChannel.send(message);
 	}
 }
 
@@ -960,7 +1001,9 @@ export async function startRuntime(
 		if (closing) return Promise.reject(new Error("The runtime is shutting down"));
 		registryStart ??= (async () => {
 			process.env.RIVETKIT_STORAGE_PATH = message.rivetStoragePath;
-			registerDevSession(message.rivetStoragePath);
+			// Dev sessions share and stop a local Engine. An external Engine is not ours to stop, and
+			// finding a spawned Engine runs `ps`, a second process that a unikernel cannot start.
+			if (message.rivetEndpoint === undefined) registerDevSession(message.rivetStoragePath);
 			configureContainerClasses(message.durableObjectManifest?.classes ?? []);
 			const classStorage = new Map(
 				(message.durableObjectManifest?.classes ?? []).map((configuredClass) => [
@@ -1407,7 +1450,10 @@ function endFetchEventWhenSocketCloses(
 	void Promise.all([closed, waitUntil]).then(end);
 }
 
-export async function runRuntimeProcess(): Promise<void> {
+export async function runRuntimeProcess(
+	channel: RuntimeParentChannel = processParentChannel(),
+): Promise<void> {
+	parentChannel = channel;
 	let runtime: Awaited<ReturnType<typeof startRuntime>> | undefined;
 	let latestSessionWorkers: RuntimeSessionWorker[] | undefined;
 	let resolveCompletion: (() => void) | undefined;
@@ -1443,7 +1489,7 @@ export async function runRuntimeProcess(): Promise<void> {
 		return stopping;
 	}
 
-	process.on("message", (rawMessage: unknown) => {
+	channel.onMessage((rawMessage: unknown) => {
 		void (async () => {
 			const message = parseRuntimeParentMessage(rawMessage);
 			if (message.type === "session-workers") {
@@ -1465,23 +1511,24 @@ export async function runRuntimeProcess(): Promise<void> {
 			}
 		})().catch((error: unknown) => {
 			send({ ...errorDetails(error), type: "fatal" });
-			process.exitCode = 1;
+			if (channel.ownsProcess) process.exitCode = 1;
 			resolveCompletion?.();
 		});
 	});
-	process.once("SIGINT", () => void stop("SIGINT"));
-	process.once("SIGTERM", () => void stop("SIGTERM"));
-	// A closed terminal sends SIGHUP to this process too, and can send it more than once. Node's
-	// default exits without stopping the Engine.
-	process.on("SIGHUP", () => void stop("SIGHUP"));
+	// In-process, the CLI owns the signals and stops the runtime with a shutdown message.
+	if (channel.ownsProcess) {
+		process.once("SIGINT", () => void stop("SIGINT"));
+		process.once("SIGTERM", () => void stop("SIGTERM"));
+		// A closed terminal sends SIGHUP to this process too, and can send it more than once. Node's
+		// default exits without stopping the Engine.
+		process.on("SIGHUP", () => void stop("SIGHUP"));
+	}
 	// The IPC channel closes when the parent dies, so the runtime stops with it.
-	process.once("disconnect", () => void stop("parent"));
+	channel.onDisconnect(() => void stop("parent"));
 	// Runs on every exit, also one during startup before a registry exists.
 	process.once("exit", signalRivetEngineStopAfterLastDevSession);
 	await completion;
-	if (process.connected) {
-		process.disconnect();
-	}
+	channel.disconnect();
 }
 
 if (process.argv[1] === new URL(import.meta.url).pathname) {
