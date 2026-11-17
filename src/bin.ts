@@ -308,6 +308,24 @@ function flushStandardStreams(): Promise<void> {
 	return Promise.all([flush(process.stdout), flush(process.stderr)]).then(() => undefined);
 }
 
+// Native addon loaders, RivetKit's among them, pick their glibc or musl binary from
+// process.report.getReport(). A host with a partial Linux ABI, such as a Unikraft unikernel, can
+// fail to build that report. With OPEN_ORANGE_LIBC=gnu or musl, a failed report names the C
+// library instead of ending the process.
+function tolerateFailingDiagnosticReports(): void {
+	const libc = process.env.OPEN_ORANGE_LIBC;
+	const report = process.report;
+	if ((libc !== "gnu" && libc !== "musl") || report === undefined) return;
+	const getReport = report.getReport.bind(report);
+	report.getReport = ((...args: Parameters<typeof report.getReport>) => {
+		try {
+			return getReport(...args);
+		} catch {
+			return { header: libc === "gnu" ? { glibcVersionRuntime: "unknown" } : {} };
+		}
+	}) as typeof report.getReport;
+}
+
 const invokedPath = process.argv[1];
 if (
 	invokedPath !== undefined &&
@@ -315,6 +333,11 @@ if (
 ) {
 	dropOutputAfterReaderCloses(process.stdout);
 	dropOutputAfterReaderCloses(process.stderr);
+	// A unikernel starts its one process in `/` and has no shell to `cd` first, so an
+	// `orange deploy --unikraft` image names its working directory here.
+	const workingDirectory = process.env.OPEN_ORANGE_CWD;
+	if (workingDirectory !== undefined && workingDirectory.length > 0) process.chdir(workingDirectory);
+	tolerateFailingDiagnosticReports();
 	const args = process.argv.slice(2);
 	const context = { args, cwd: process.cwd(), env: process.env };
 	// Only a name Orange knows goes in the report. Any other argument can hold anything.
